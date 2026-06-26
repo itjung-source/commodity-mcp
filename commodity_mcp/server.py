@@ -2,7 +2,8 @@
 Commodity MCP Server
 Provides real-time commodity prices scraped from Trading Economics + Yahoo Finance (BTC).
 
-Commodities: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal
+Commodities: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal,
+             BDI (Baltic Dry Index), World Container Index, Containerized Freight Index
 """
 from __future__ import annotations
 
@@ -19,7 +20,9 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP(
     name="Commodity Prices",
     instructions=(
-        "Get real-time commodity prices: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal. "
+        "Get real-time commodity prices and shipping rates. "
+        "Commodities: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal. "
+        "Shipping: BDI (Baltic Dry Index), World Container Index (WCI), Containerized Freight Index (CCFI). "
         "Data sourced from Trading Economics (scraping) and Yahoo Finance (BTC). "
         "Tools: get_commodity_prices (all), get_commodity_price (single by key)."
     ),
@@ -29,18 +32,25 @@ mcp = FastMCP(
 # Config
 # ---------------------------------------------------------------------------
 
-COMMODITY_ORDER = ["gold", "btc", "oil", "palmoil", "sugar", "rubber", "coal"]
+COMMODITY_ORDER = [
+    "gold", "btc", "oil", "palmoil", "sugar", "rubber", "coal",
+    "bdi", "wci", "ccfi",
+]
 
+# Commodities scraped from tradingeconomics.com/commodities (one request)
 TE_COMMODITIES = {
-    "gold":    {"keyword": "Gold",      "exact_start": True,  "name": "ทอง (Gold)"},
-    "oil":     {"keyword": "Crude Oil", "exact_start": True,  "name": "น้ำมัน WTI (Crude Oil)"},
-    "sugar":   {"keyword": "Sugar",     "exact_start": True,  "name": "น้ำตาล (Sugar)"},
-    "coal":    {"keyword": "Coal",      "exact_start": True,  "name": "ถ่านหิน (Coal)"},
-    "palmoil": {"keyword": "Palm Oil",  "exact_start": False, "name": "น้ำมันปาล์ม (Palm Oil)"},
-    "rubber":  {"keyword": "Rubber",    "exact_start": True,  "name": "ยางพารา (Rubber)"},
+    "gold":    {"keyword": "Gold",                    "exact_start": True,  "name": "ทอง (Gold)"},
+    "oil":     {"keyword": "Crude Oil",               "exact_start": True,  "name": "น้ำมัน WTI (Crude Oil)"},
+    "sugar":   {"keyword": "Sugar",                   "exact_start": True,  "name": "น้ำตาล (Sugar)"},
+    "coal":    {"keyword": "Coal",                    "exact_start": True,  "name": "ถ่านหิน (Coal)"},
+    "palmoil": {"keyword": "Palm Oil",                "exact_start": False, "name": "น้ำมันปาล์ม (Palm Oil)"},
+    "rubber":  {"keyword": "Rubber",                  "exact_start": True,  "name": "ยางพารา (Rubber)"},
+    "wci":     {"keyword": "World Container Index",   "exact_start": True,  "name": "ค่าระวาง Container WCI",  "unit": "USD"},
+    "ccfi":    {"keyword": "Containerized Freight",   "exact_start": True,  "name": "ดัชนีระวางเรือ CCFI",    "unit": "Points"},
 }
 
 TE_URL = "https://tradingeconomics.com/commodities"
+TE_BDI_URL = "https://tradingeconomics.com/commodity/baltic"
 TE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -73,11 +83,19 @@ def _pct(cells: list[str], idx: int) -> Optional[float]:
         return None
 
 
+def _parse_pct_str(s: str) -> Optional[float]:
+    try:
+        return float(s.replace("%", "").replace("+", "").replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Data fetchers
 # ---------------------------------------------------------------------------
 
 def _fetch_te() -> dict[str, dict]:
+    """Scrape tradingeconomics.com/commodities for all TE_COMMODITIES in one request."""
     if _is_fresh("te"):
         return _cache["te"]["data"]
 
@@ -115,7 +133,7 @@ def _fetch_te() -> dict[str, dict]:
                         "change_day_pct": _pct(cells, 3),
                         "change_week_pct": _pct(cells, 4),
                         "change_month_pct": _pct(cells, 5),
-                        "unit": _parse_unit(name_cell),
+                        "unit": cfg.get("unit") or _parse_unit(name_cell),
                         "date": cells[-1],
                         "source": "Trading Economics",
                         "updated_at": datetime.utcnow().isoformat() + "Z",
@@ -133,7 +151,87 @@ def _fetch_te() -> dict[str, dict]:
     return result
 
 
+def _fetch_bdi() -> dict:
+    """Scrape BDI (Baltic Dry Index) from tradingeconomics.com/commodity/baltic."""
+    if _is_fresh("bdi"):
+        return _cache["bdi"]["data"]
+
+    try:
+        r = requests.get(TE_BDI_URL, headers=TE_HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # ราคาจาก JSON ใน script tag
+        price = None
+        for script in soup.find_all("script"):
+            text = script.string or ""
+            m = re.search(r'"last"\s*:\s*([0-9.]+)', text)
+            if m and "Baltic" in text:
+                price = float(m.group(1))
+                break
+
+        # day% / month% จาก stats summary table ใน page text
+        page_text = soup.get_text()
+        lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+
+        day_pct = month_pct = date_str = None
+        for i, line in enumerate(lines):
+            # หาบรรทัดที่มีตัวเลขราคา BDI แล้วดู context
+            if price and str(int(price)) in line.replace(",", "") and len(line) < 20:
+                # รูปแบบ: price / day_abs / day% / month% / year% / date
+                candidates = lines[i:i+6]
+                pct_vals = []
+                for c in candidates:
+                    if "%" in c:
+                        pct_vals.append(_parse_pct_str(c))
+                if len(pct_vals) >= 1:
+                    day_pct = pct_vals[0]
+                if len(pct_vals) >= 2:
+                    month_pct = pct_vals[1]
+                break
+
+        # fallback: ดึงจาก description text เช่น "down 1.63% from the previous day"
+        if day_pct is None:
+            m = re.search(r'(up|down)\s+([\d.]+)%\s+from the previous day', page_text, re.I)
+            if m:
+                sign = -1 if m.group(1).lower() == "down" else 1
+                day_pct = sign * float(m.group(2))
+
+        # หา date
+        m_date = re.search(r'on\s+([A-Z][a-z]+ \d+, \d{4})', page_text)
+        if m_date:
+            try:
+                dt = datetime.strptime(m_date.group(1), "%B %d, %Y")
+                date_str = dt.strftime("%b/%d")
+            except ValueError:
+                date_str = m_date.group(1)
+
+        data = {
+            "key": "bdi",
+            "name": "ค่าระวางเรือ BDI (Baltic Dry Index)",
+            "price": price,
+            "change_day_pct": day_pct,
+            "change_week_pct": None,  # TE individual page ไม่มี week%
+            "change_month_pct": month_pct,
+            "unit": "Index Points",
+            "date": date_str,
+            "source": "Trading Economics",
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+    except Exception as e:
+        data = {
+            "key": "bdi",
+            "name": "ค่าระวางเรือ BDI (Baltic Dry Index)",
+            "error": str(e),
+            "source": "Trading Economics",
+        }
+
+    _cache["bdi"] = {"ts": time.time(), "data": data}
+    return data
+
+
 def _fetch_btc() -> dict:
+    """Get BTC price from Yahoo Finance (not available on TE commodities page)."""
     if _is_fresh("btc"):
         return _cache["btc"]["data"]
 
@@ -176,7 +274,12 @@ def _get_all() -> list[dict]:
     te = _fetch_te()
     result = []
     for key in COMMODITY_ORDER:
-        result.append(_fetch_btc() if key == "btc" else te.get(key, {"key": key, "error": "not found"}))
+        if key == "btc":
+            result.append(_fetch_btc())
+        elif key == "bdi":
+            result.append(_fetch_bdi())
+        else:
+            result.append(te.get(key, {"key": key, "error": "not found"}))
     return result
 
 
@@ -186,73 +289,86 @@ def _get_all() -> list[dict]:
 
 @mcp.tool()
 def get_commodity_prices() -> str:
-    """Get real-time prices for all 7 commodities: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal.
+    """Get real-time prices for all commodities and shipping rates.
 
-    Returns price, day%, week%, and month% change for each commodity.
-    Data sourced from Trading Economics (scrape) and Yahoo Finance (BTC).
+    Commodities: Gold, BTC, Oil (WTI), Palm Oil, Sugar, Rubber, Coal
+    Shipping: BDI (Baltic Dry Index), WCI (World Container Index), CCFI (Containerized Freight Index)
+
+    Returns price, day%, week%, month% change for each item.
     Cache TTL: 5 minutes.
     """
     items = _get_all()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"🌍 Commodity Prices  [{now}]", "─" * 55]
+    lines = [f"Commodity & Shipping Prices  [{now}]", "=" * 55]
 
-    for d in items:
-        if "error" in d:
-            lines.append(f"❌ {d['name']}: {d['error']}")
-            continue
+    sections = {
+        "Commodities": ["gold", "btc", "oil", "palmoil", "sugar", "rubber", "coal"],
+        "Shipping Rates": ["bdi", "wci", "ccfi"],
+    }
 
-        def fmt(v):
-            if v is None: return "  N/A "
-            sign = "+" if v >= 0 else ""
-            return f"{sign}{v:.1f}%"
+    item_map = {d["key"]: d for d in items if "key" in d}
 
-        lines.append(
-            f"{d['name']}\n"
-            f"  ราคา: {d['price']:,} {d.get('unit','')}  ({d.get('date','')})\n"
-            f"  Day:{fmt(d.get('change_day_pct'))}  "
-            f"Week:{fmt(d.get('change_week_pct'))}  "
-            f"Month:{fmt(d.get('change_month_pct'))}"
-        )
-        lines.append("")
+    def fmt(v):
+        if v is None:
+            return "  N/A "
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.1f}%"
+
+    for section, keys in sections.items():
+        lines.append(f"\n[{section}]")
+        for key in keys:
+            d = item_map.get(key, {"key": key, "error": "not found", "name": key})
+            if "error" in d:
+                lines.append(f"  {d.get('name', key)}: ERROR")
+                continue
+            lines.append(
+                f"  {d['name']}\n"
+                f"    {d['price']:,} {d.get('unit','')}  ({d.get('date','')})\n"
+                f"    Day:{fmt(d.get('change_day_pct'))}  "
+                f"Week:{fmt(d.get('change_week_pct'))}  "
+                f"Month:{fmt(d.get('change_month_pct'))}"
+            )
 
     return "\n".join(lines)
 
 
 @mcp.tool()
 def get_commodity_price(key: str) -> str:
-    """Get real-time price for a single commodity.
+    """Get real-time price for a single commodity or shipping index.
 
     Args:
-        key: Commodity key — one of: gold, btc, oil, palmoil, sugar, rubber, coal
+        key: One of: gold, btc, oil, palmoil, sugar, rubber, coal, bdi, wci, ccfi
 
     Returns price, day%, week%, month% change with source and timestamp.
     """
     key = key.lower().strip()
-    valid = COMMODITY_ORDER
 
     if key == "btc":
         d = _fetch_btc()
+    elif key == "bdi":
+        d = _fetch_bdi()
     elif key in TE_COMMODITIES:
         d = _fetch_te().get(key, {"key": key, "error": "not found"})
     else:
-        return f"❌ ไม่รู้จัก key '{key}'\nใช้ได้: {', '.join(valid)}"
+        return f"Unknown key '{key}'. Valid: {', '.join(COMMODITY_ORDER)}"
 
     if "error" in d:
-        return f"❌ {d['name']}: {d['error']}"
+        return f"ERROR {d.get('name', key)}: {d['error']}"
 
     def fmt(v):
-        if v is None: return "N/A"
+        if v is None:
+            return "N/A"
         sign = "+" if v >= 0 else ""
         return f"{sign}{v:.2f}%"
 
     return (
-        f"📊 {d['name']}\n"
-        f"ราคา: {d['price']:,} {d.get('unit','')}\n"
-        f"วันที่: {d.get('date','')}\n"
-        f"Day:   {fmt(d.get('change_day_pct'))}\n"
-        f"Week:  {fmt(d.get('change_week_pct'))}\n"
-        f"Month: {fmt(d.get('change_month_pct'))}\n"
-        f"Source: {d.get('source','')} | {d.get('updated_at','')}"
+        f"{d['name']}\n"
+        f"Price:  {d['price']:,} {d.get('unit','')}\n"
+        f"Date:   {d.get('date','')}\n"
+        f"Day:    {fmt(d.get('change_day_pct'))}\n"
+        f"Week:   {fmt(d.get('change_week_pct'))}\n"
+        f"Month:  {fmt(d.get('change_month_pct'))}\n"
+        f"Source: {d.get('source','')}  |  {d.get('updated_at','')}"
     )
 
 
